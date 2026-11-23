@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Master - Universal PDF Processing</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="description" content="Universal PDF processing web application">
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide React -->
+  <script defer src="https://unpkg.com/lucide-react@0.429.0/dist/umd/lucide-react.js"></script>
+</head>
+<body class="bg-white dark:bg-gray-900 text-gray-900 antialiased">
+  <div id="root"></div>
+  <!-- PWA Install Prompt -->
+  <div id="pwa-install" class="fixed bottom-4 left-1/2 -translate-x-1/2 hidden z-50">
+    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 shadow-lg border border-gray-200 dark:border-gray-700 max-w-md w-full">
+      <h3 class="text-lg font-bold text-gray-900 dark:text-gray-100 mb-3">Install PDF Master</h3>
+      <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
+        Install PDF Master on your device for quick access and offline support.
+      </p>
+      <div class="flex gap-3">
+        <button id="install-yes" class="bg-primary-600 text-white px-6 py-3 rounded-lg font-medium hover:bg-primary-700 transition-colors">
+          Install
+        </button>
+        <button id="install-no" class="border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 px-6 py-3 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
+          Not Now
+        </button>
+      </div>
+    </div>
+  </div>
+  <script>
+    // Check for PWA installation support
+    if ('serviceWorker' in navigator && 'viewport' in window) {
+      // Check if not already installed
+      if (!window.matchMedia('(display-mode: standalone)').matches) {
+        // Check if there's a manifest
+        if (window.navigator.standalone === false) {
+          document.getElementById('pwa-install').classList.remove('hidden');
+        }
+      }
+    }
+
+    // Register service worker
+    if (process.env.NODE_ENV === 'production') {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/service-worker.js')
+          .then(registration => {
+            console.log('Service worker registered:', registration.scope);
+          })
+          .catch(error => {
+            console.error('Service worker registration failed:', error);
+          });
+      });
+    }
+  </script>
+</body>
+</html>
