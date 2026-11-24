@@ -32,30 +32,5 @@
       </div>
     </div>
   </div>
-  <script>
-    // Check for PWA installation support
-    if ('serviceWorker' in navigator && 'viewport' in window) {
-      // Check if not already installed
-      if (!window.matchMedia('(display-mode: standalone)').matches) {
-        // Check if there's a manifest
-        if (window.navigator.standalone === false) {
-          document.getElementById('pwa-install').classList.remove('hidden');
-        }
-      }
-    }
-
-    // Register service worker
-    if (process.env.NODE_ENV === 'production') {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/service-worker.js')
-          .then(registration => {
-            console.log('Service worker registered:', registration.scope);
-          })
-          .catch(error => {
-            console.error('Service worker registration failed:', error);
-          });
-      });
-    }
-  </script>
 </body>
 </html>
