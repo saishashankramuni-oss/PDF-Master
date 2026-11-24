@@ -31,13 +31,13 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy requirements first for caching
-COPY requirements.txt .
+COPY backend/requirements.txt ./requirements.txt
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY backend/ .
 
 # Create temporary directories
 RUN mkdir -p /tmp/uploads /tmp/outputs /tmp/jobs
