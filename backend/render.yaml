@@ -4,8 +4,8 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: ./backend
-    plan: starter
-    region: oregon
+    plan: free
+    region: singapore
     envVars:
       - key: PORT
         value: "8000"
