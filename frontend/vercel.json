@@ -7,11 +7,11 @@
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "https://pdf-master-backend.onrender.com/api/$1"
+      "destination": "https://pdf-master-backend-i5rm.onrender.com/api/$1"
     },
     {
       "source": "/health",
-      "destination": "https://pdf-master-backend.onrender.com/health"
+      "destination": "https://pdf-master-backend-i5rm.onrender.com/health"
     },
     {
       "source": "/(.*)",
