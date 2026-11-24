@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { BrowserRouter as Router, Routes, Route, Link, useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { ArrowLeft, Menu, X, Search, Sun, Moon, Globe, Shield, Lock, Image, FileText, Upload, Calendar, HelpCircle, Info, Trash, Loader2 } from 'lucide-react'
 
 import {
@@ -31,7 +31,6 @@ export default function App() {
   const [showFilePreview, setShowFilePreview] = useState(false)
   const [showToolPage, setShowToolPage] = useState(false)
   const [theme, setTheme] = useState('light')
-  const navigate = useNavigate()
 
   // Check for PWA installation support
   useEffect(() => {
@@ -109,7 +108,6 @@ export default function App() {
   }
 
   return (
-    <Router>
       <div className="min-h-screen" data-theme={theme}>
         {/* Mobile Navigation */}
         <MobileNavigation theme={theme} onThemeToggle={handleThemeToggle} />
@@ -190,7 +188,6 @@ export default function App() {
           onCancel={() => {}}
         />
       </div>
-    </Router>
   )
 }
 
