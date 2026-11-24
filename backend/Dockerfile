@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     libnss3 \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
-    libgdk-pixbuf2.0-0 \
+    libgdk-pixbuf-2.0-0 \
     libffi-dev \
     shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y \
 # Install Tesseract OCR
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
-    tesseract-ocr-dev \
+    libtesseract-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install LibreOffice for document conversion
