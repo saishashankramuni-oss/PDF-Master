@@ -153,6 +153,11 @@ from services.performance import (
 # API Endpoints
 # ============================================================
 
+@app.get("/")
+async def root():
+    """Basic service check for hosting platforms."""
+    return {"name": "PDF Master API", "status": "running", "health": "/health", "docs": "/api/docs"}
+
 @app.get("/health", response_model=HealthCheck)
 async def health_check():
     """Health check endpoint."""
