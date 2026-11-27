@@ -67,7 +67,7 @@ npm run dev
 |---------|-----|
 | Frontend | http://localhost:3000 |
 | Backend API | http://127.0.0.1:8000 |
-| API Documentation | http://127.0.0.1:8000/api/docs |
+| API Documentation | http://127.0.0.1:8000/docs |
 | Health Check | http://127.0.0.1:8000/health |
 
 ## Available PDF Tools (31 Total)
@@ -231,7 +231,7 @@ Before using, verify:
 - [ ] `start.bat` runs without errors
 - [ ] Backend responds at `http://127.0.0.1:8000/health`
 - [ ] Frontend loads at `http://localhost:3000`
-- [ ] API docs at `http://127.0.0.1:8000/api/docs`
+- [ ] API docs at `http://127.0.0.1:8000/docs`
 - [ ] Can upload a PDF
 - [ ] Can process a PDF (try Merge/Compress)
 - [ ] Download works and file opens

@@ -3,23 +3,18 @@ services:
     name: pdf-master-backend
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
-    dockerContext: ./backend
+    dockerContext: .
     plan: free
     region: singapore
+    branch: main
+    autoDeployTrigger: commit
+    healthCheckPath: /health
     envVars:
-      - key: PORT
-        value: "8000"
-      - key: ENVIRONMENT
-        value: "production"
       - key: MAX_FILE_SIZE_MB
         value: "50"
       - key: JOB_RETENTION_MINUTES
         value: "30"
       - key: LOG_LEVEL
         value: "INFO"
-      - key: SECRET_KEY
-        generateValue: true
       - key: ALLOWED_ORIGINS
         value: "https://pdf-master.vercel.app"
-    healthCheckPath: /health
-    autoDeploy: true

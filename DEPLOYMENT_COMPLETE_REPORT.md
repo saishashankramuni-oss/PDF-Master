@@ -1,5 +1,10 @@
 # PDF Master - AUTONOMOUS DEPLOYMENT REPORT
 
+> **Historical snapshot — do not use the deployment commands or readiness claims below.**
+> They predate the current `main` branch and contain obsolete repository and hosting
+> settings. Use [DEPLOYMENT.md](DEPLOYMENT.md) and the repository-root `render.yaml`
+> for current deployment configuration and verification steps.
+
 ## Deployment Status: CODE COMPLETE - Deployment Blocker Active
 
 ### Current Situation

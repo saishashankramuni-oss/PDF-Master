@@ -90,7 +90,7 @@ docker-compose up --build
 # Access:
 # Frontend: http://localhost:3000
 # Backend API: http://localhost:8000
-# API Docs: http://localhost:8000/api/docs
+# API Docs: http://localhost:8000/docs
 ```
 
 ## Project Structure
@@ -209,16 +209,18 @@ pdf-master/
    - Build Command: `npm run build`
    - Output Directory: `dist`
    - Framework: Vite
-3. Set Environment Variable:
-   - `VITE_API_URL=https://your-backend.onrender.com`
+   - Root Directory: `frontend`
+3. `frontend/vercel.json` proxies `/api/*` requests to the Render backend. Update its
+   rewrite destination if the backend URL changes.
 
 ### Backend (Render)
 
 1. Create new Web Service on Render
 2. Select Docker runtime
-3. Set Dockerfile path: `./backend/Dockerfile`
-3. Configure Environment Variables from `.env.production.example`
-4. Set Health Check Path: `/health`
+3. Use Dockerfile path `./backend/Dockerfile` and repository-root Docker context (`.`)
+4. Configure environment variables from the root `render.yaml`
+5. Set Health Check Path: `/health`
+6. API documentation is available at `/docs`; the OpenAPI specification is at `/openapi.json`.
 
 ### Docker Production
 

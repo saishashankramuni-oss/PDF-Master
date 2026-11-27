@@ -13,54 +13,19 @@ This guide covers deploying the PDF Master application to **Vercel (Frontend)** 
 
 ## Backend Deployment (Render)
 
-### Option 1: Render Dashboard (Recommended)
+### Render Blueprint (Recommended)
 
-1. **Create a new Web Service on Render**
-   - Go to https://dashboard.render.com
-   - Click "New +" → "Web Service"
-   - Connect your GitHub repository
+The repository-root `render.yaml` defines the backend service on branch `main`.
+Connect this repository to Render and apply the Blueprint. It configures:
 
-2. **Configure the Service**
-   - **Name**: `pdf-master-backend`
-   - **Runtime**: `Docker`
-   - **Dockerfile Path**: `./backend/Dockerfile`
-   - **Docker Context**: `./backend`
-   - **Plan**: `Starter` (free tier: 512MB RAM, 0.5 CPU)
-   - **Region**: Choose closest to your users
+- Dockerfile: `backend/Dockerfile`
+- Docker context: repository root (`.`), required by the Dockerfile's `COPY backend/...` commands
+- Health check: `/health`
+- `MAX_FILE_SIZE_MB`, `JOB_RETENTION_MINUTES`, `LOG_LEVEL`, and `ALLOWED_ORIGINS`
 
-3. **Environment Variables** (Add in Render dashboard → Environment)
-   ```
-   PORT=8000
-   ENVIRONMENT=production
-   MAX_FILE_SIZE_MB=50
-   JOB_RETENTION_MINUTES=30
-   LOG_LEVEL=INFO
-   SECRET_KEY=<generate-secure-random-32-chars>
-   ALLOWED_ORIGINS=https://your-frontend.vercel.app
-   ```
-
-4. **Health Check**
-   - **Path**: `/health`
-   - **Interval**: 30 seconds
-
-5. **Deploy**
-   - Click "Create Web Service"
-   - Wait for build and deploy (5-10 minutes)
-   - Note your backend URL: `https://pdf-master-backend.onrender.com`
-
-### Option 2: Render CLI (Advanced)
-
-```bash
-# Install Render CLI
-npm install -g @render/cli
-
-# Login
-render login
-
-# Deploy using render.yaml
-cd backend
-render deploy
-```
+Render supplies the runtime `PORT`; do not set it to a fixed value in the service
+environment. The container binds Uvicorn to `0.0.0.0` and uses that assigned port.
+The configured frontend origin is `https://pdf-master.vercel.app`.
 
 ### Verify Backend Deployment
 
@@ -69,7 +34,10 @@ render deploy
 curl https://your-backend.onrender.com/health
 
 # Test API docs
-open https://your-backend.onrender.com/api/docs
+open https://your-backend.onrender.com/docs
+
+# Test the OpenAPI specification
+curl https://your-backend.onrender.com/openapi.json
 ```
 
 ---
@@ -88,12 +56,8 @@ open https://your-backend.onrender.com/api/docs
    - **Root Directory**: `frontend`
    - **Build Command**: `npm run build`
    - **Output Directory**: `dist`
-   - **Install Command**: `npm install`
-
-3. **Environment Variables** (Add in Vercel dashboard → Settings → Environment Variables)
-   ```
-   VITE_API_URL=https://your-backend.onrender.com
-   ```
+   - **Install Command**: `npm ci`
+   - The `frontend/vercel.json` API rewrites send `/api/*` requests to the configured Render backend.
 
 3. **Deploy**
    - Click "Deploy"
@@ -116,7 +80,8 @@ vercel --prod
 
 ### Configure Vercel Rewrites (for API proxy)
 
-The `vercel.json` file is already configured. If you need to update the backend URL:
+The `frontend/vercel.json` file proxies API requests to the backend. If the Render
+URL changes:
 
 1. Edit `frontend/vercel.json`
 2. Update the rewrite destination:
@@ -163,7 +128,7 @@ After both deployments are complete:
 ### Backend (Render)
 1. Render Dashboard → Service → Settings → Custom Domains
 2. Add subdomain (e.g., `api.example.com`)
-3. Update frontend `VITE_API_URL` to use custom domain
+3. Update the frontend API rewrite destination to use the custom domain
 4. Update backend `ALLOWED_ORIGINS` to include custom domain
 
 ---
@@ -219,7 +184,7 @@ curl -f https://your-frontend.vercel.app/api/tools
 
 | Issue | Solution |
 |-------|----------|
-| API calls fail | Check `VITE_API_URL` in Vercel env vars |
+| API calls fail | Check the backend URL in `frontend/vercel.json` and the Render service status |
 | PWA not installing | Verify `manifest.json` served correctly |
 | Styles broken | Check Tailwind CDN or build output |
 | API proxy 404 | Update `vercel.json` rewrite destination |
@@ -267,7 +232,6 @@ curl -X POST https://backend.onrender.com/api/pdf/compress \
 
 ## Security Checklist
 
-- [ ] `SECRET_KEY` is 32+ random characters
 - [ ] `ALLOWED_ORIGINS` only includes your domains
 - [ ] HTTPS enforced (automatic on both platforms)
 - [ ] Security headers present (CSP, HSTS, etc.)

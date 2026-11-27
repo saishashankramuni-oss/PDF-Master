@@ -1,13 +1,18 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Minimal OS layer: the currently enabled PDF tools use PyMuPDF.
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# Install the system tools used by OCR and Office document conversions.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    libreoffice-writer \
+    libreoffice-calc \
+    libreoffice-impress \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt ./requirements.txt

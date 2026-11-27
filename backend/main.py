@@ -5,7 +5,7 @@ FastAPI-based PDF processing service
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from starlette.background import BackgroundTask
 import zipfile
 from pydantic import BaseModel, Field
@@ -14,16 +14,64 @@ import os
 import uuid
 import tempfile
 import shutil
-import zipfile
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import struct
 import logging
 import json
 import fitz
+from urllib.parse import urlparse
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+
+def _positive_int_setting(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
+
+def _allowed_origins() -> List[str]:
+    configured = os.getenv("ALLOWED_ORIGINS")
+    origins = (
+        [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
+        if configured is not None
+        else ["http://localhost:3000", "http://127.0.0.1:3000"]
+    )
+    if not origins:
+        raise RuntimeError("ALLOWED_ORIGINS must contain at least one HTTP or HTTPS origin")
+    for origin in origins:
+        parsed = urlparse(origin)
+        if (
+            origin == "*"
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+        ):
+            raise RuntimeError(f"Invalid origin in ALLOWED_ORIGINS: {origin}")
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid origin in ALLOWED_ORIGINS: {origin}") from exc
+    return origins
+
+
+MAX_FILE_SIZE_MB = _positive_int_setting("MAX_FILE_SIZE_MB", 50)
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+JOB_RETENTION_MINUTES = _positive_int_setting("JOB_RETENTION_MINUTES", 30)
+ALLOWED_ORIGINS = _allowed_origins()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+if not isinstance(getattr(logging, LOG_LEVEL, None), int):
+    raise RuntimeError("LOG_LEVEL must be a valid Python logging level")
+
+logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
@@ -31,14 +79,15 @@ app = FastAPI(
     title="PDF Master API",
     description="Universal PDF processing web application",
     version="1.0.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc"
+    openapi_url="/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,10 +104,8 @@ app.add_middleware(RequestLoggingMiddleware)
 # Configuration
 # ============================================================
 
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 MAX_CONCURRENT_JOBS = 5
 JOB_TIMEOUT = 300  # 5 minutes
-JOB_RETENTION_MINUTES = 30
 
 # ============================================================
 # Models
@@ -155,6 +202,7 @@ from services.advanced import (
     get_pdf_metadata, generate_page_previews, get_advanced_info
 )
 from services.cleanup import cleanup_service, start_cleanup_service, stop_cleanup_service, get_cleanup_service
+cleanup_service.job_retention_minutes = JOB_RETENTION_MINUTES
 from services.performance import (
     performance_monitor_instance, async_cache, periodic_cache_cleanup,
     get_performance_monitor, get_async_cache, log_performance_stats
@@ -167,7 +215,24 @@ from services.performance import (
 @app.get("/")
 async def root():
     """Basic service check for hosting platforms."""
-    return {"name": "PDF Master API", "status": "running", "health": "/health", "docs": "/api/docs"}
+    return {
+        "name": "PDF Master API",
+        "status": "running",
+        "health": "/health",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "tools": ["merge", "split", "rotate", "compress", "extract-text", "metadata"],
+    }
+
+
+@app.get("/api/docs", include_in_schema=False)
+async def legacy_docs():
+    return RedirectResponse(url="/docs", status_code=307)
+
+
+@app.get("/api/redoc", include_in_schema=False)
+async def legacy_redoc():
+    return RedirectResponse(url="/redoc", status_code=307)
 
 @app.post("/api/process/{tool}")
 async def process_pdf_direct(tool: str, files: List[UploadFile] = File(...), angle: int = Form(90), quality: str = Form("medium")):
@@ -181,7 +246,10 @@ async def process_pdf_direct(tool: str, files: List[UploadFile] = File(...), ang
     for upload in files:
         data = await upload.read()
         if not data or len(data) > MAX_FILE_SIZE or not validate_pdf_signature(data):
-            raise HTTPException(status_code=400, detail=f"Invalid PDF or file exceeds 50 MB: {upload.filename}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid PDF or file exceeds {MAX_FILE_SIZE_MB} MB: {upload.filename}",
+            )
         contents.append(data)
     if tool != "merge" and len(contents) != 1:
         raise HTTPException(status_code=400, detail="This operation accepts exactly one PDF")
@@ -205,7 +273,7 @@ async def process_pdf_direct(tool: str, files: List[UploadFile] = File(...), ang
             filename, media_type = "compressed.pdf", "application/pdf"
         elif tool == "extract-text":
             doc = fitz.open(stream=contents[0], filetype="pdf")
-            text_content = "\\n\\n".join(page.get_text() for page in doc)
+            text_content = "\n\n".join(page.get_text() for page in doc)
             doc.close()
             result = text_content.encode("utf-8")
             filename, media_type = "extracted-text.txt", "text/plain; charset=utf-8"
@@ -246,7 +314,17 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
 
-def _find_job_output(job_id: str) -> Optional[str]:
+def _find_job_output(job_id: str, output_filename: Optional[str] = None) -> Optional[str]:
+    if output_filename:
+        expected_path = os.path.join(
+            "/tmp",
+            "jobs",
+            job_id,
+            os.path.basename(output_filename),
+        )
+        if os.path.isfile(expected_path):
+            return expected_path
+
     candidates = [
         os.path.join("/tmp", "outputs", f"{job_id}_output.pdf"),
         os.path.join("/tmp", "jobs", job_id),
@@ -280,7 +358,7 @@ async def download_job_get(job_id: str, token: Optional[str] = None):
     job = jobs[job_id]
     if job.status != "completed":
         raise HTTPException(status_code=409, detail=f"Job is {job.status}")
-    output_path = _find_job_output(job_id)
+    output_path = _find_job_output(job_id, job.output_filename)
     if not output_path:
         raise HTTPException(status_code=404, detail="Output file not found")
 
@@ -309,7 +387,7 @@ async def download_job_post(job_id: str, download_request: DownloadRequest):
     job = jobs[job_id]
     if job.status != "completed":
         raise HTTPException(status_code=409, detail=f"Job is {job.status}")
-    output_path = _find_job_output(job_id)
+    output_path = _find_job_output(job_id, job.output_filename)
     if not output_path:
         raise HTTPException(status_code=404, detail="Output file not found")
     return FileResponse(output_path, filename=job.output_filename or os.path.basename(output_path), media_type="application/octet-stream")
@@ -2246,6 +2324,7 @@ async def metadata_endpoint(
         original_filename=file.filename,
         tool="metadata"
     )
+    download_token = issue_download_token(job_id)
 
     async def process_metadata():
         try:
@@ -2265,15 +2344,18 @@ async def metadata_endpoint(
             jobs[job_id].progress = 100.0
             jobs[job_id].output_filename = "metadata.json"
 
-            token = generate_download_token()
-            download_tokens[token] = job_id
         except Exception as e:
             jobs[job_id].status = "failed"
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
     background_tasks.add_task(process_metadata)
-    return {"job_id": job_id, "status": "pending", "message": "Metadata extraction started."}
+    return {
+        "job_id": job_id,
+        "status": "pending",
+        "message": "Metadata extraction started.",
+        "download_token": download_token,
+    }
 
 
 @app.post("/api/pdf/preview")
