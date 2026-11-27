@@ -183,6 +183,16 @@ def check_job_processing(first, second):
         ("metadata", "/api/pdf/metadata", {}, [
             ("file", "test_sample.pdf", first),
         ]),
+        ("add-annotation", "/api/pdf/add-annotation", {
+            "page_number": "1",
+            "annotation_type": "highlight",
+            "x0": "72",
+            "y0": "72",
+            "x1": "180",
+            "y1": "100",
+        }, [
+            ("file", "test_sample.pdf", first),
+        ]),
     ]
 
     for name, path, fields, files in tests:
@@ -196,12 +206,13 @@ def check_job_processing(first, second):
                 break
             time.sleep(0.25)
         assert job and job["status"] == "completed", (name, job)
-        assert token, f"{name} did not return a download token"
+        token = token or job.get("download_token")
+        assert token, f"{name} did not expose a download token in its job response"
 
         status, headers, output = get_download(job_id, token)
         assert status == 200
         content_type = headers.get_content_type()
-        if name in {"merge", "rotate", "compress"}:
+        if name in {"merge", "rotate", "compress", "add-annotation"}:
             assert content_type == "application/pdf", (name, content_type)
             assert_pdf(output, 3 if name == "merge" else 2)
         elif name == "split":

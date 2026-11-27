@@ -188,25 +188,27 @@ def organize_pages(pdf_data: bytes, operation: str,
                 output_buffer.seek(0)
                 return output_buffer.read()
 
-            # Create new document with moved page
+            # Move the source page within its final ordering before copying pages.
+            page_order = list(range(total_pages))
+            moved_page = page_order.pop(from_page - 1)
+            page_order.insert(to_page - 1, moved_page)
             new_doc = fitz.open()
+            for page_index in page_order:
+                new_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
 
-            # First, add all pages except the one to move
-            for i in range(total_pages):
-                if i != from_page - 1:
-                    new_doc.insert_pdf(doc, from_page=i, to_page=i)
+        elif operation == "copy":
+            pages_to_copy = page_data.get("pages", [])
+            if not pages_to_copy:
+                raise ValueError("At least one page must be selected for copying")
+            if any(not isinstance(page, int) or page < 1 or page > total_pages for page in pages_to_copy):
+                raise ValueError("Copy page numbers must be valid 1-based page numbers")
 
-            # Insert the moved page at the new position
-            page_to_move = doc[from_page - 1]
-            new_doc.insert_pdf(doc, from_page=to_page - 1, to_page=to_page - 1)
+            new_doc = fitz.open()
+            for page_num in pages_to_copy:
+                new_doc.insert_pdf(doc, from_page=page_num - 1, to_page=page_num - 1)
 
         else:
-            # Default: return original document
-            output_buffer = io.BytesIO()
-            doc.save(output_buffer)
-            doc.close()
-            output_buffer.seek(0)
-            return output_buffer.read()
+            raise ValueError(f"Unsupported page organization operation: {operation}")
 
         # Save to bytes
         output_buffer = io.BytesIO()

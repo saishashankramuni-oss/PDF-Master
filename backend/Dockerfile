@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PDF_MASTER_TEMP_DIR=/tmp/pdf-master
 
 WORKDIR /app
 
@@ -21,7 +22,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY backend/ .
 
-RUN mkdir -p /tmp/uploads /tmp/outputs /tmp/jobs
+RUN mkdir -p /tmp/pdf-master/uploads /tmp/pdf-master/outputs /tmp/pdf-master/jobs
 
 EXPOSE 8000
 

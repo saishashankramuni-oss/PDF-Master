@@ -23,8 +23,8 @@ def repair_pdf(pdf_data: bytes, aggressive: bool = False) -> bytes:
     if not pdf_data or len(pdf_data) < 5:
         raise ValueError("Invalid PDF file - too small")
 
+    doc = None
     try:
-        # First, try to open with PyMuPDF which is quite robust
         doc = fitz.open(stream=pdf_data, filetype="pdf")
 
         # If we can open it, check if it has pages
@@ -43,21 +43,10 @@ def repair_pdf(pdf_data: bytes, aggressive: bool = False) -> bytes:
         return output_buffer.read()
 
     except Exception as e:
-        # If standard repair fails, try more aggressive approaches
-        if aggressive:
-            try:
-                # Try to read as raw stream and reconstruct
-                import re
-                # Look for PDF objects and try to reconstruct
-                # This is a simplified approach - real repair is complex
-                output_buffer = io.BytesIO()
-                output_buffer.write(pdf_data)
-                output_buffer.seek(0)
-                return output_buffer.read()
-            except Exception:
-                pass
-
-        raise RuntimeError(f"PDF repair failed: {str(e)}")
+        raise RuntimeError(f"PDF repair failed: {str(e)}") from e
+    finally:
+        if doc is not None:
+            doc.close()
 
 
 def get_repair_info(pdf_data: bytes) -> dict:

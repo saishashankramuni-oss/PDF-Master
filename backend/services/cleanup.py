@@ -7,6 +7,7 @@ import os
 import shutil
 import asyncio
 import time
+import tempfile
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from pathlib import Path
@@ -17,12 +18,15 @@ class CleanupService:
 
     def __init__(
         self,
-        base_temp_dir: str = "/tmp",
+        base_temp_dir: Optional[str] = None,
         job_retention_minutes: int = 30,
         max_temp_size_mb: int = 1024,
         cleanup_interval_seconds: int = 300  # 5 minutes
     ):
-        self.base_temp_dir = base_temp_dir
+        self.base_temp_dir = os.path.abspath(
+            base_temp_dir
+            or os.getenv("PDF_MASTER_TEMP_DIR", os.path.join(tempfile.gettempdir(), "pdf-master"))
+        )
         self.job_retention_minutes = job_retention_minutes
         self.max_temp_size_mb = max_temp_size_mb
         self.cleanup_interval_seconds = cleanup_interval_seconds
@@ -30,9 +34,9 @@ class CleanupService:
         self._task: Optional[asyncio.Task] = None
 
         # Directory structure
-        self.jobs_dir = os.path.join(base_temp_dir, "jobs")
-        self.uploads_dir = os.path.join(base_temp_dir, "uploads")
-        self.outputs_dir = os.path.join(base_temp_dir, "outputs")
+        self.jobs_dir = os.path.join(self.base_temp_dir, "jobs")
+        self.uploads_dir = os.path.join(self.base_temp_dir, "uploads")
+        self.outputs_dir = os.path.join(self.base_temp_dir, "outputs")
 
     def start(self):
         """Start the background cleanup task."""

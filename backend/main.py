@@ -14,11 +14,13 @@ import os
 import uuid
 import tempfile
 import shutil
+import base64
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 import struct
 import logging
 import json
+import math
 import fitz
 from urllib.parse import urlparse
 
@@ -66,6 +68,12 @@ def _allowed_origins() -> List[str]:
 MAX_FILE_SIZE_MB = _positive_int_setting("MAX_FILE_SIZE_MB", 50)
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 JOB_RETENTION_MINUTES = _positive_int_setting("JOB_RETENTION_MINUTES", 30)
+TEMP_STORAGE_DIR = os.path.abspath(
+    os.getenv("PDF_MASTER_TEMP_DIR", os.path.join(tempfile.gettempdir(), "pdf-master"))
+)
+JOBS_DIR = os.path.join(TEMP_STORAGE_DIR, "jobs")
+OUTPUTS_DIR = os.path.join(TEMP_STORAGE_DIR, "outputs")
+UPLOADS_DIR = os.path.join(TEMP_STORAGE_DIR, "uploads")
 ALLOWED_ORIGINS = _allowed_origins()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 if not isinstance(getattr(logging, LOG_LEVEL, None), int):
@@ -91,6 +99,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 # Security and performance middleware
@@ -106,6 +115,23 @@ app.add_middleware(RequestLoggingMiddleware)
 
 MAX_CONCURRENT_JOBS = 5
 JOB_TIMEOUT = 300  # 5 minutes
+job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+
+
+async def _run_limited_job(task: Callable[[], None]) -> None:
+    async with job_semaphore:
+        await asyncio.to_thread(task)
+
+
+async def _cleanup_expired_job_state() -> None:
+    while True:
+        await asyncio.sleep(cleanup_service.cleanup_interval_seconds)
+        cutoff = datetime.utcnow() - timedelta(minutes=JOB_RETENTION_MINUTES)
+        for job_id, job in list(jobs.items()):
+            if job.status in {"pending", "processing"} or job.created_at > cutoff:
+                continue
+            jobs.pop(job_id, None)
+            _remove_job_download_tokens(job_id)
 
 # ============================================================
 # Models
@@ -121,6 +147,7 @@ class JobStatus(BaseModel):
     progress: Optional[float] = 0.0
     error_message: Optional[str] = None
     tool: Optional[str] = None
+    download_token: Optional[str] = None
 
 class JobCreate(BaseModel):
     tool: str
@@ -139,8 +166,8 @@ class HealthCheck(BaseModel):
 # ============================================================
 
 jobs: Dict[str, JobStatus] = {}
-download_tokens: Dict[str, str] = {}  # token -> job_id mapping
-job_locks: Dict[str, asyncio.Lock] = {}  # Per-job locks for concurrency
+download_tokens: Dict[str, Any] = {}  # token -> job ID or expiration timestamp
+job_state_cleanup_task: Optional[asyncio.Task] = None
 
 # ============================================================
 # Utility Functions
@@ -151,6 +178,20 @@ def validate_pdf_signature(file_content: bytes) -> bool:
     if len(file_content) < 5:
         return False
     return file_content[:5] == b'%PDF-'
+
+async def _read_limited_upload(upload: UploadFile, require_pdf: bool = False) -> bytes:
+    filename = upload.filename or "uploaded file"
+    content = await upload.read(MAX_FILE_SIZE + 1)
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{filename} exceeds the {MAX_FILE_SIZE_MB} MB upload limit",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail=f"{filename} is empty")
+    if require_pdf and not validate_pdf_signature(content):
+        raise HTTPException(status_code=400, detail=f"{filename} is not a valid PDF file")
+    return content
 
 def generate_job_id() -> str:
     """Generate a unique job ID."""
@@ -165,6 +206,31 @@ def issue_download_token(job_id: str) -> str:
     download_tokens[token] = job_id
     download_tokens[f"{token}_time"] = datetime.utcnow() + timedelta(minutes=JOB_RETENTION_MINUTES)
     return token
+
+def _job_download_token(job_id: str) -> str:
+    job = jobs[job_id]
+    now = datetime.utcnow()
+    if now - job.created_at >= timedelta(minutes=JOB_RETENTION_MINUTES):
+        raise HTTPException(status_code=410, detail="Job has expired")
+
+    for token, owner_job_id in list(download_tokens.items()):
+        if token.endswith("_time") or owner_job_id != job_id:
+            continue
+        expires_at = download_tokens.get(f"{token}_time")
+        if expires_at is None:
+            expires_at = job.created_at + timedelta(minutes=JOB_RETENTION_MINUTES)
+            download_tokens[f"{token}_time"] = expires_at
+        if now <= expires_at:
+            return token
+        download_tokens.pop(token, None)
+        download_tokens.pop(f"{token}_time", None)
+    return issue_download_token(job_id)
+
+def _remove_job_download_tokens(job_id: str) -> None:
+    for token, owner_job_id in list(download_tokens.items()):
+        if not token.endswith("_time") and owner_job_id == job_id:
+            download_tokens.pop(token, None)
+            download_tokens.pop(f"{token}_time", None)
 
 def is_valid_pdf_path(path: str) -> bool:
     """Check for path traversal attacks."""
@@ -195,7 +261,7 @@ from services.convert import (
 from services.edit import (
     add_text_to_pdf, add_image_to_pdf, add_watermark_to_pdf,
     add_page_numbers_to_pdf, add_signature_to_pdf, add_annotation_to_pdf,
-    get_edit_info
+    get_edit_info, SUPPORTED_ANNOTATION_TYPES
 )
 from services.advanced import (
     ocr_pdf, redact_pdf, compare_pdfs, extract_text, extract_images,
@@ -244,13 +310,7 @@ async def process_pdf_direct(tool: str, files: List[UploadFile] = File(...), ang
         raise HTTPException(status_code=400, detail="Upload at least one file")
     contents = []
     for upload in files:
-        data = await upload.read()
-        if not data or len(data) > MAX_FILE_SIZE or not validate_pdf_signature(data):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid PDF or file exceeds {MAX_FILE_SIZE_MB} MB: {upload.filename}",
-            )
-        contents.append(data)
+        contents.append(await _read_limited_upload(upload, require_pdf=True))
     if tool != "merge" and len(contents) != 1:
         raise HTTPException(status_code=400, detail="This operation accepts exactly one PDF")
     try:
@@ -312,32 +372,28 @@ async def get_job_status(job_id: str):
     """Get job status by ID."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    job = jobs[job_id]
+    token = _job_download_token(job_id) if job.status == "completed" else None
+    return job.copy(update={"download_token": token})
 
 def _find_job_output(job_id: str, output_filename: Optional[str] = None) -> Optional[str]:
     if output_filename:
-        expected_path = os.path.join(
-            "/tmp",
-            "jobs",
-            job_id,
-            os.path.basename(output_filename),
-        )
-        if os.path.isfile(expected_path):
-            return expected_path
+        expected_path = os.path.join(JOBS_DIR, job_id, os.path.basename(output_filename))
+        return expected_path if os.path.isfile(expected_path) else None
 
-    candidates = [
-        os.path.join("/tmp", "outputs", f"{job_id}_output.pdf"),
-        os.path.join("/tmp", "jobs", job_id),
-        os.path.join(tempfile.gettempdir(), "jobs", job_id),
-    ]
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-        if os.path.isdir(candidate):
-            for name in sorted(os.listdir(candidate)):
-                path = os.path.join(candidate, name)
-                if os.path.isfile(path):
-                    return path
+    legacy_output = os.path.join(OUTPUTS_DIR, f"{job_id}_output.pdf")
+    if os.path.isfile(legacy_output):
+        return legacy_output
+
+    job_directory = os.path.join(JOBS_DIR, job_id)
+    if os.path.isdir(job_directory):
+        files = [
+            os.path.join(job_directory, name)
+            for name in sorted(os.listdir(job_directory))
+            if os.path.isfile(os.path.join(job_directory, name))
+        ]
+        if len(files) == 1:
+            return files[0]
     return None
 
 def _verified_download(job_id: str, token: Optional[str]):
@@ -346,6 +402,9 @@ def _verified_download(job_id: str, token: Optional[str]):
     if download_tokens.get(token) != job_id:
         raise HTTPException(status_code=403, detail="Invalid or expired download token")
     token_time = download_tokens.get(f"{token}_time")
+    if token_time is None and job_id in jobs:
+        token_time = jobs[job_id].created_at + timedelta(minutes=JOB_RETENTION_MINUTES)
+        download_tokens[f"{token}_time"] = token_time
     if token_time and datetime.utcnow() > token_time:
         raise HTTPException(status_code=410, detail="Download link expired")
 
@@ -401,196 +460,29 @@ async def delete_job(job_id: str):
     job = jobs[job_id]
 
     # Delete output file if exists
-    output_path = f"/tmp/outputs/{job_id}_output.pdf"
+    output_path = os.path.join(OUTPUTS_DIR, f"{job_id}_output.pdf")
     if os.path.exists(output_path):
         os.remove(output_path)
 
     # Delete temp job directory
-    job_temp_dir = f"/tmp/jobs/{job_id}"
+    job_temp_dir = os.path.join(JOBS_DIR, job_id)
     if os.path.exists(job_temp_dir):
         shutil.rmtree(job_temp_dir, ignore_errors=True)
 
     # Clean up from job store
     del jobs[job_id]
 
-    # Clean up download token
-    if download_tokens.get(job_id):
-        del download_tokens[job_id]
-    if f"{download_tokens.get(job_id)}_time" in download_tokens:
-        del download_tokens[f"{download_tokens.get(job_id)}_time"]
+    _remove_job_download_tokens(job_id)
 
     return {"message": "Job deleted successfully"}
 
 @app.post("/api/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    """Upload a PDF file for processing."""
-    # Read file content
-    content = await file.read()
-
-    # Validate file
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)} MB"
-        )
-
-    # Validate PDF signature
-    if not validate_pdf_signature(content):
-        raise HTTPException(status_code=400, detail="Invalid PDF file")
-
-    # Generate job ID
-    job_id = generate_job_id()
-
-    # Create job record
-    jobs[job_id] = JobStatus(
-        job_id=job_id,
-        status="pending",
-        created_at=datetime.utcnow(),
-        original_filename=file.filename,
-        tool="unknown"
+async def upload_file(file: UploadFile = File(...)):
+    """Reject uploads without a selected processing operation."""
+    raise HTTPException(
+        status_code=400,
+        detail="Select a PDF tool and use its dedicated processing endpoint.",
     )
-
-    # Ensure lock exists
-    if job_id not in job_locks:
-        job_locks[job_id] = asyncio.Lock()
-
-    # Start background processing with lock
-    async def process_with_lock():
-        async with job_locks[job_id]:
-            await _process_job(job_id, content)
-
-    background_tasks.add_task(process_with_lock)
-
-    return {
-        "job_id": job_id,
-        "status": "pending",
-        "message": "File uploaded successfully. Processing started."
-    }
-
-async def _process_job(job_id: str, file_data: bytes):
-    """Process a PDF job in the background."""
-    try:
-        jobs[job_id].status = "processing"
-        jobs[job_id].progress = 0.0
-        jobs[job_id].tool = "unknown"
-
-        # Create temporary directory for this job
-        job_temp_dir = f"/tmp/jobs/{job_id}"
-        os.makedirs(job_temp_dir, exist_ok=True)
-
-        # Write input file
-        input_path = os.path.join(job_temp_dir, "input.pdf")
-        with open(input_path, "wb") as f:
-            f.write(file_data)
-
-        # ... processing will be done by specific tool handlers
-        # For now, mark as completed after a brief processing time
-        await asyncio.sleep(2)
-
-        # Generate output filename
-        output_filename = f"{job_id}_output.pdf"
-
-        # Update job status
-        jobs[job_id].status = "completed"
-        jobs[job_id].completed_at = datetime.utcnow()
-        jobs[job_id].progress = 100.0
-        jobs[job_id].output_filename = output_filename
-
-        # Generate download token
-        token = generate_download_token()
-        download_tokens[token] = job_id
-        jobs[job_id].output_filename = output_filename
-
-        # Set token expiration time
-        download_tokens[f"{token}_time"] = datetime.utcnow() + timedelta(minutes=JOB_RETENTION_MINUTES)
-
-        # Schedule cleanup
-        asyncio.create_task(cleanup_job_files(job_id, job_temp_dir))
-
-    except Exception as e:
-        jobs[job_id].status = "failed"
-        jobs[job_id].error_message = str(e)
-        jobs[job_id].completed_at = datetime.utcnow()
-        # Clean up on failure
-        job_temp_dir = f"/tmp/jobs/{job_id}"
-        if os.path.exists(job_temp_dir):
-            shutil.rmtree(job_temp_dir, ignore_errors=True)
-
-async def cleanup_job_files(job_id: str, job_temp_dir: str):
-    """Clean up temporary job files."""
-    try:
-        await asyncio.sleep(JOB_RETENTION_MINUTES * 60)
-        if os.path.exists(job_temp_dir):
-            shutil.rmtree(job_temp_dir, ignore_errors=True)
-        # Remove from job store
-        if job_id in jobs:
-            del jobs[job_id]
-    except Exception:
-        pass
-
-async def generate_output_file(job_id: str):
-    """Generate output file for a completed job."""
-    if job_id not in jobs:
-        raise ValueError("Job not found")
-
-    job = jobs[job_id]
-
-    # Based on tool type, generate appropriate output
-    job_temp_dir = f"/tmp/jobs/{job_id}"
-    input_path = os.path.join(job_temp_dir, "input.pdf")
-
-    if not os.path.exists(input_path):
-        return
-
-    try:
-        # Read the original input
-        with open(input_path, "rb") as f:
-            file_data = f.read()
-
-        # Determine tool and generate output
-        tool = job.tool or "unknown"
-
-        if tool == "merge":
-            # For merge, we need multiple files - return original
-            shutil.copy2(input_path, f"/tmp/outputs/{job_id}_output.pdf")
-        elif tool == "split":
-            # For split, create a single output with first page
-            import fitz
-            doc = fitz.open(input_path)
-            if doc.page_count > 0:
-                output_path = f"/tmp/outputs/{job_id}_output.pdf"
-                doc.save(output_path)
-                doc.close()
-            else:
-                doc.close()
-                shutil.copy2(input_path, f"/tmp/outputs/{job_id}_output.pdf")
-        elif tool == "rotate":
-            # Rotate 0 degrees (return as-is)
-            shutil.copy2(input_path, f"/tmp/outputs/{job_id}_output.pdf")
-        elif tool == "compress":
-            # Just copy for now
-            shutil.copy2(input_path, f"/tmp/outputs/{job_id}_output.pdf")
-        elif tool == "protect":
-            # Just copy for now
-            shutil.copy2(input_path, f"/tmp/outputs/{job_id}_output.pdf")
-        elif tool == "unlock":
-            # Just copy for now
-            shutil.copy2(input_path, f"/tmp/outputs/{job_id}_output.pdf")
-        elif tool == "ocr":
-            # Just copy for now
-            shutil.copy2(input_path, f"/tmp/outputs/{job_id}_output.pdf")
-        else:
-            # Default: return original
-            shutil.copy2(input_path, f"/tmp/outputs/{job_id}_output.pdf")
-
-    except Exception as e:
-        raise RuntimeError(f"Failed to generate output: {str(e)}")
 
 # ============================================================
 # Tool-specific API Endpoints
@@ -605,12 +497,7 @@ async def merge_pdf_endpoint(
     # Validate all files
     pdf_data_list = []
     for uploaded_file in files:
-        content = await uploaded_file.read()
-        if not content or len(content) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail=f"Invalid file: {uploaded_file.filename}")
-        if not validate_pdf_signature(content):
-            raise HTTPException(status_code=400, detail=f"Invalid PDF: {uploaded_file.filename}")
-        pdf_data_list.append(content)
+        pdf_data_list.append(await _read_limited_upload(uploaded_file, require_pdf=True))
 
     # Generate job ID
     job_id = generate_job_id()
@@ -626,7 +513,7 @@ async def merge_pdf_endpoint(
     download_token = issue_download_token(job_id)
 
     # Start background processing
-    async def process_merge():
+    def process_merge():
         try:
             jobs[job_id].status = "processing"
 
@@ -634,7 +521,7 @@ async def merge_pdf_endpoint(
             merged_data = merge_pdfs(pdf_data_list)
 
             # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Write merged PDF
@@ -657,7 +544,7 @@ async def merge_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_merge)
+    background_tasks.add_task(_run_limited_job, process_merge)
 
     return {
         "job_id": job_id,
@@ -674,7 +561,7 @@ async def split_pdf_endpoint(
 ):
     """Split a PDF into individual pages or selected ranges."""
     # Read file content
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
     if not content or len(content) > MAX_FILE_SIZE or not validate_pdf_signature(content):
         raise HTTPException(status_code=400, detail="Invalid PDF file")
 
@@ -700,7 +587,7 @@ async def split_pdf_endpoint(
     download_token = issue_download_token(job_id)
 
     # Start background processing
-    async def process_split():
+    def process_split():
         try:
             jobs[job_id].status = "processing"
 
@@ -708,7 +595,7 @@ async def split_pdf_endpoint(
             results = split_pdf(content, page_numbers=page_list if page_list else None)
 
             # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Save each split part
@@ -743,7 +630,7 @@ async def split_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_split)
+    background_tasks.add_task(_run_limited_job, process_split)
 
     return {
         "job_id": job_id,
@@ -760,7 +647,7 @@ async def rotate_pdf_endpoint(
 ):
     """Rotate a PDF by specified angle."""
     # Read file content
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
     if not content or len(content) > MAX_FILE_SIZE or not validate_pdf_signature(content):
         raise HTTPException(status_code=400, detail="Invalid PDF file")
 
@@ -778,7 +665,7 @@ async def rotate_pdf_endpoint(
     download_token = issue_download_token(job_id)
 
     # Start background processing
-    async def process_rotate():
+    def process_rotate():
         try:
             jobs[job_id].status = "processing"
 
@@ -786,7 +673,7 @@ async def rotate_pdf_endpoint(
             rotated_data = rotate_pdf(content, angle=angle)
 
             # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Write rotated PDF
@@ -809,7 +696,7 @@ async def rotate_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_rotate)
+    background_tasks.add_task(_run_limited_job, process_rotate)
 
     return {
         "job_id": job_id,
@@ -826,7 +713,7 @@ async def compress_pdf_endpoint(
 ):
     """Compress a PDF file."""
     # Read file content
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
     if not content or len(content) > MAX_FILE_SIZE or not validate_pdf_signature(content):
         raise HTTPException(status_code=400, detail="Invalid PDF file")
 
@@ -844,7 +731,7 @@ async def compress_pdf_endpoint(
     download_token = issue_download_token(job_id)
 
     # Start background processing
-    async def process_compress():
+    def process_compress():
         try:
             jobs[job_id].status = "processing"
 
@@ -852,7 +739,7 @@ async def compress_pdf_endpoint(
             compressed_data = compress_pdf(content, quality=quality)
 
             # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Write compressed PDF
@@ -875,7 +762,7 @@ async def compress_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_compress)
+    background_tasks.add_task(_run_limited_job, process_compress)
 
     return {
         "job_id": job_id,
@@ -893,7 +780,7 @@ async def organize_pdf_endpoint(
 ):
     """Organize PDF pages (remove, extract, reorder)."""
     # Read file content
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     # Parse page data
     import json
@@ -915,15 +802,19 @@ async def organize_pdf_endpoint(
     )
 
     # Start background processing
-    async def process_organize():
+    def process_organize():
         try:
             jobs[job_id].status = "processing"
 
-            # Organize the PDF
-            result_data = organize_pages(content, operation, page_dict)
+            if operation.lower() == "remove":
+                result_data = remove_pages(content, page_dict.get("pages", []))
+            elif operation.lower() == "extract":
+                result_data = extract_pages(content, page_dict.get("pages", []))
+            else:
+                result_data = organize_pages(content, operation, page_dict)
 
             # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Write organized PDF
@@ -946,7 +837,7 @@ async def organize_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_organize)
+    background_tasks.add_task(_run_limited_job, process_organize)
 
     return {
         "job_id": job_id,
@@ -965,7 +856,7 @@ async def protect_pdf_endpoint(
 ):
     """Password-protect a PDF file."""
     # Read file content
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     # Parse permissions
     import json
@@ -987,7 +878,7 @@ async def protect_pdf_endpoint(
     )
 
     # Start background processing
-    async def process_protect():
+    def process_protect():
         try:
             jobs[job_id].status = "processing"
 
@@ -995,7 +886,7 @@ async def protect_pdf_endpoint(
             protected_data = protect_pdf(content, password, owner_password, user_password, perm_dict)
 
             # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Write protected PDF
@@ -1018,7 +909,7 @@ async def protect_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_protect)
+    background_tasks.add_task(_run_limited_job, process_protect)
 
     return {
         "job_id": job_id,
@@ -1034,7 +925,7 @@ async def unlock_pdf_endpoint(
 ):
     """Unlock a password-protected PDF file."""
     # Read file content
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     # Generate job ID
     job_id = generate_job_id()
@@ -1049,7 +940,7 @@ async def unlock_pdf_endpoint(
     )
 
     # Start background processing
-    async def process_unlock():
+    def process_unlock():
         try:
             jobs[job_id].status = "processing"
 
@@ -1057,7 +948,7 @@ async def unlock_pdf_endpoint(
             unlocked_data = unlock_pdf_simple(content, password)
 
             # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Write unlocked PDF
@@ -1080,100 +971,12 @@ async def unlock_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_unlock)
+    background_tasks.add_task(_run_limited_job, process_unlock)
 
     return {
         "job_id": job_id,
         "status": "pending",
         "message": "PDF unlock started. Processing in background."
-    }
-
-@app.post("/api/pdf/ocr")
-async def ocr_pdf_endpoint(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
-):
-    """Run OCR on a scanned PDF."""
-    # Read file content
-    content = await file.read()
-
-    # Generate job ID
-    job_id = generate_job_id()
-
-    # Create job record
-    jobs[job_id] = JobStatus(
-        job_id=job_id,
-        status="pending",
-        created_at=datetime.utcnow(),
-        original_filename=file.filename,
-        tool="ocr"
-    )
-
-    # Start background processing
-    async def process_ocr():
-        try:
-            jobs[job_id].status = "processing"
-
-            # For OCR, we'll use a simple approach with PyMuPDF
-            # In a full implementation, this would use Tesseract
-            import fitz
-            doc = fitz.open(stream=content, filetype="pdf")
-
-            # Check if PDF appears to be scanned (no text layers)
-            is_scanned = True
-            for page_num in range(min(doc.page_count, 3)):  # Check first 3 pages
-                text = doc[page_num].get_text("text")
-                if text.strip():
-                    is_scanned = False
-                    break
-
-            if is_scanned:
-                # Apply basic OCR-like processing (placeholder)
-                # In production, integrate with Tesseract
-                for page_num in range(doc.page_count):
-                    doc[page_num].set_text("OCR processed page")
-            else:
-                # Document already has text, just copy
-                pass
-
-            # Save result
-            output_buffer = io.BytesIO()
-            doc.save(output_buffer)
-            doc.close()
-
-            output_buffer.seek(0)
-            ocr_data = output_buffer.read()
-
-            # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
-            os.makedirs(job_temp_dir, exist_ok=True)
-
-            # Write OCR result
-            output_path = os.path.join(job_temp_dir, "ocr_output.pdf")
-            with open(output_path, "wb") as f:
-                f.write(ocr_data)
-
-            # Update job status
-            jobs[job_id].status = "completed"
-            jobs[job_id].completed_at = datetime.utcnow()
-            jobs[job_id].progress = 100.0
-            jobs[job_id].output_filename = "ocr_output.pdf"
-
-            # Generate download token
-            token = generate_download_token()
-            download_tokens[token] = job_id
-
-        except Exception as e:
-            jobs[job_id].status = "failed"
-            jobs[job_id].error_message = str(e)
-            jobs[job_id].completed_at = datetime.utcnow()
-
-    background_tasks.add_task(process_ocr)
-
-    return {
-        "job_id": job_id,
-        "status": "pending",
-        "message": "OCR processing started. Processing in background."
     }
 
 @app.post("/api/pdf/repair")
@@ -1184,7 +987,7 @@ async def repair_pdf_endpoint(
 ):
     """Repair a corrupted or damaged PDF file."""
     # Read file content
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     # Generate job ID
     job_id = generate_job_id()
@@ -1199,7 +1002,7 @@ async def repair_pdf_endpoint(
     )
 
     # Start background processing
-    async def process_repair():
+    def process_repair():
         try:
             jobs[job_id].status = "processing"
 
@@ -1207,7 +1010,7 @@ async def repair_pdf_endpoint(
             repaired_data = repair_pdf(content, aggressive=aggressive)
 
             # Create temp directory
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Write repaired PDF
@@ -1230,7 +1033,7 @@ async def repair_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_repair)
+    background_tasks.add_task(_run_limited_job, process_repair)
 
     return {
         "job_id": job_id,
@@ -1248,7 +1051,7 @@ async def pdf_to_word_endpoint(
     file: UploadFile = File(...)
 ):
     """Convert PDF to Word document (.docx)."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1265,12 +1068,12 @@ async def pdf_to_word_endpoint(
         tool="to-word"
     )
 
-    async def process_to_word():
+    def process_to_word():
         try:
             jobs[job_id].status = "processing"
             word_data = pdf_to_word(content)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.docx")
@@ -1289,7 +1092,7 @@ async def pdf_to_word_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_to_word)
+    background_tasks.add_task(_run_limited_job, process_to_word)
     return {"job_id": job_id, "status": "pending", "message": "PDF to Word conversion started."}
 
 
@@ -1300,7 +1103,7 @@ async def pdf_to_jpg_endpoint(
     dpi: int = Form(default=150)
 ):
     """Convert PDF to JPG images (one per page)."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1317,12 +1120,12 @@ async def pdf_to_jpg_endpoint(
         tool="to-jpg"
     )
 
-    async def process_to_jpg():
+    def process_to_jpg():
         try:
             jobs[job_id].status = "processing"
             images = pdf_to_images(content, output_format="jpg", dpi=dpi)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Save all images
@@ -1351,7 +1154,7 @@ async def pdf_to_jpg_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_to_jpg)
+    background_tasks.add_task(_run_limited_job, process_to_jpg)
     return {"job_id": job_id, "status": "pending", "message": "PDF to JPG conversion started."}
 
 
@@ -1363,10 +1166,7 @@ async def jpg_to_pdf_endpoint(
     """Convert JPG images to PDF."""
     image_data_list = []
     for f in files:
-        content = await f.read()
-        if not content:
-            continue
-        image_data_list.append(content)
+        image_data_list.append(await _read_limited_upload(f))
 
     if not image_data_list:
         raise HTTPException(status_code=400, detail="No valid images provided")
@@ -1380,12 +1180,12 @@ async def jpg_to_pdf_endpoint(
         tool="jpg-to-pdf"
     )
 
-    async def process_jpg_to_pdf():
+    def process_jpg_to_pdf():
         try:
             jobs[job_id].status = "processing"
             pdf_data = images_to_pdf(image_data_list)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -1404,7 +1204,7 @@ async def jpg_to_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_jpg_to_pdf)
+    background_tasks.add_task(_run_limited_job, process_jpg_to_pdf)
     return {"job_id": job_id, "status": "pending", "message": "JPG to PDF conversion started."}
 
 
@@ -1414,7 +1214,7 @@ async def pdf_to_excel_endpoint(
     file: UploadFile = File(...)
 ):
     """Convert PDF to Excel (.xlsx)."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1431,12 +1231,12 @@ async def pdf_to_excel_endpoint(
         tool="to-excel"
     )
 
-    async def process_to_excel():
+    def process_to_excel():
         try:
             jobs[job_id].status = "processing"
             excel_data = pdf_to_excel(content)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.xlsx")
@@ -1455,7 +1255,7 @@ async def pdf_to_excel_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_to_excel)
+    background_tasks.add_task(_run_limited_job, process_to_excel)
     return {"job_id": job_id, "status": "pending", "message": "PDF to Excel conversion started."}
 
 
@@ -1465,7 +1265,7 @@ async def excel_to_pdf_endpoint(
     file: UploadFile = File(...)
 ):
     """Convert Excel (.xlsx) to PDF."""
-    content = await file.read()
+    content = await _read_limited_upload(file)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1479,12 +1279,12 @@ async def excel_to_pdf_endpoint(
         tool="excel-to-pdf"
     )
 
-    async def process_excel_to_pdf():
+    def process_excel_to_pdf():
         try:
             jobs[job_id].status = "processing"
             pdf_data = excel_to_pdf(content)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -1503,7 +1303,7 @@ async def excel_to_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_excel_to_pdf)
+    background_tasks.add_task(_run_limited_job, process_excel_to_pdf)
     return {"job_id": job_id, "status": "pending", "message": "Excel to PDF conversion started."}
 
 
@@ -1513,7 +1313,7 @@ async def pdf_to_powerpoint_endpoint(
     file: UploadFile = File(...)
 ):
     """Convert PDF to PowerPoint (.pptx)."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1530,12 +1330,12 @@ async def pdf_to_powerpoint_endpoint(
         tool="to-powerpoint"
     )
 
-    async def process_to_powerpoint():
+    def process_to_powerpoint():
         try:
             jobs[job_id].status = "processing"
             ppt_data = pdf_to_powerpoint(content)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pptx")
@@ -1554,7 +1354,7 @@ async def pdf_to_powerpoint_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_to_powerpoint)
+    background_tasks.add_task(_run_limited_job, process_to_powerpoint)
     return {"job_id": job_id, "status": "pending", "message": "PDF to PowerPoint conversion started."}
 
 
@@ -1564,7 +1364,7 @@ async def powerpoint_to_pdf_endpoint(
     file: UploadFile = File(...)
 ):
     """Convert PowerPoint (.pptx) to PDF."""
-    content = await file.read()
+    content = await _read_limited_upload(file)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1578,12 +1378,12 @@ async def powerpoint_to_pdf_endpoint(
         tool="powerpoint-to-pdf"
     )
 
-    async def process_powerpoint_to_pdf():
+    def process_powerpoint_to_pdf():
         try:
             jobs[job_id].status = "processing"
             pdf_data = powerpoint_to_pdf(content)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -1602,7 +1402,7 @@ async def powerpoint_to_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_powerpoint_to_pdf)
+    background_tasks.add_task(_run_limited_job, process_powerpoint_to_pdf)
     return {"job_id": job_id, "status": "pending", "message": "PowerPoint to PDF conversion started."}
 
 # ============================================================
@@ -1623,7 +1423,7 @@ async def add_text_endpoint(
     rotation: float = Form(default=0)
 ):
     """Add text to a PDF page."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1646,12 +1446,12 @@ async def add_text_endpoint(
         tool="add-text"
     )
 
-    async def process_add_text():
+    def process_add_text():
         try:
             jobs[job_id].status = "processing"
             result = add_text_to_pdf(content, page_number, x, y, text, font_size, font_name, color_tuple, rotation)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -1670,7 +1470,7 @@ async def add_text_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_add_text)
+    background_tasks.add_task(_run_limited_job, process_add_text)
     return {"job_id": job_id, "status": "pending", "message": "Add text started."}
 
 
@@ -1687,8 +1487,8 @@ async def add_image_endpoint(
     keep_aspect_ratio: bool = Form(default=True)
 ):
     """Add an image to a PDF page."""
-    content = await file.read()
-    image_data = await image.read()
+    content = await _read_limited_upload(file, require_pdf=True)
+    image_data = await _read_limited_upload(image)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid PDF file size")
@@ -1708,12 +1508,12 @@ async def add_image_endpoint(
         tool="add-image"
     )
 
-    async def process_add_image():
+    def process_add_image():
         try:
             jobs[job_id].status = "processing"
             result = add_image_to_pdf(content, page_number, x, y, image_data, width, height, keep_aspect_ratio)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -1732,7 +1532,7 @@ async def add_image_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_add_image)
+    background_tasks.add_task(_run_limited_job, process_add_image)
     return {"job_id": job_id, "status": "pending", "message": "Add image started."}
 
 
@@ -1748,7 +1548,7 @@ async def add_watermark_endpoint(
     pages: str = Form(default="")
 ):
     """Add a watermark to PDF pages."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1779,12 +1579,12 @@ async def add_watermark_endpoint(
         tool="add-watermark"
     )
 
-    async def process_add_watermark():
+    def process_add_watermark():
         try:
             jobs[job_id].status = "processing"
             result = add_watermark_to_pdf(content, watermark_text, font_size, color_tuple, opacity, rotation, page_list)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -1803,7 +1603,7 @@ async def add_watermark_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_add_watermark)
+    background_tasks.add_task(_run_limited_job, process_add_watermark)
     return {"job_id": job_id, "status": "pending", "message": "Add watermark started."}
 
 
@@ -1820,7 +1620,7 @@ async def add_page_numbers_endpoint(
     pages: str = Form(default="")
 ):
     """Add page numbers to PDF pages."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -1851,12 +1651,12 @@ async def add_page_numbers_endpoint(
         tool="add-page-numbers"
     )
 
-    async def process_add_page_numbers():
+    def process_add_page_numbers():
         try:
             jobs[job_id].status = "processing"
             result = add_page_numbers_to_pdf(content, start_number, format_string, position, font_size, font_name, color_tuple, page_list)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -1875,7 +1675,7 @@ async def add_page_numbers_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_add_page_numbers)
+    background_tasks.add_task(_run_limited_job, process_add_page_numbers)
     return {"job_id": job_id, "status": "pending", "message": "Add page numbers started."}
 
 
@@ -1891,8 +1691,8 @@ async def add_signature_endpoint(
     height: float = Form(default=75)
 ):
     """Add a signature to a PDF page."""
-    content = await file.read()
-    signature_data = await signature.read()
+    content = await _read_limited_upload(file, require_pdf=True)
+    signature_data = await _read_limited_upload(signature)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid PDF file size")
@@ -1912,12 +1712,12 @@ async def add_signature_endpoint(
         tool="add-signature"
     )
 
-    async def process_add_signature():
+    def process_add_signature():
         try:
             jobs[job_id].status = "processing"
             result = add_signature_to_pdf(content, page_number, x, y, signature_data, width, height)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -1936,7 +1736,7 @@ async def add_signature_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_add_signature)
+    background_tasks.add_task(_run_limited_job, process_add_signature)
     return {"job_id": job_id, "status": "pending", "message": "Add signature started."}
 
 
@@ -1955,7 +1755,7 @@ async def add_annotation_endpoint(
     opacity: float = Form(default=0.5)
 ):
     """Add an annotation to a PDF page."""
-    pdf_data = await file.read()
+    pdf_data = await _read_limited_upload(file, require_pdf=True)
 
     if not pdf_data or len(pdf_data) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid PDF file size")
@@ -1963,11 +1763,24 @@ async def add_annotation_endpoint(
     if pdf_data[:5] != b'%PDF-':
         raise HTTPException(status_code=400, detail="Invalid PDF file")
 
-    # Parse color
+    annotation_type = annotation_type.strip().lower()
+    if annotation_type not in SUPPORTED_ANNOTATION_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported annotation type")
+    if page_number < 1 or not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+        raise HTTPException(status_code=400, detail="Page and annotation coordinates must be valid")
+    if x1 <= x0 or y1 <= y0:
+        raise HTTPException(status_code=400, detail="Annotation right/bottom coordinates must exceed left/top")
+    if annotation_type == "free_text" and not content.strip():
+        raise HTTPException(status_code=400, detail="Text content is required for a free-text annotation")
+
     try:
-        color_tuple = tuple(float(c) for c in color.split(","))
-    except:
-        color_tuple = (1, 1, 0)
+        color_tuple = tuple(float(component) for component in color.split(","))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Color must contain three comma-separated RGB values") from exc
+    if len(color_tuple) != 3 or not all(math.isfinite(component) and 0 <= component <= 1 for component in color_tuple):
+        raise HTTPException(status_code=400, detail="Color RGB values must each be between 0 and 1")
+    if not math.isfinite(opacity) or not 0 <= opacity <= 1:
+        raise HTTPException(status_code=400, detail="Opacity must be between 0 and 1")
 
     job_id = generate_job_id()
     jobs[job_id] = JobStatus(
@@ -1978,12 +1791,12 @@ async def add_annotation_endpoint(
         tool="add-annotation"
     )
 
-    async def process_add_annotation():
+    def process_add_annotation():
         try:
             jobs[job_id].status = "processing"
             result = add_annotation_to_pdf(pdf_data, page_number, annotation_type, (x0, y0, x1, y1), content, color_tuple, opacity)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -2002,7 +1815,7 @@ async def add_annotation_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_add_annotation)
+    background_tasks.add_task(_run_limited_job, process_add_annotation)
     return {"job_id": job_id, "status": "pending", "message": "Add annotation started."}
 
 # ============================================================
@@ -2017,7 +1830,7 @@ async def ocr_pdf_endpoint(
     dpi: int = Form(default=300)
 ):
     """Perform OCR on a PDF to make scanned pages searchable."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -2034,12 +1847,12 @@ async def ocr_pdf_endpoint(
         tool="ocr"
     )
 
-    async def process_ocr():
+    def process_ocr():
         try:
             jobs[job_id].status = "processing"
             result = ocr_pdf(content, language=language, dpi=dpi)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -2058,7 +1871,7 @@ async def ocr_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_ocr)
+    background_tasks.add_task(_run_limited_job, process_ocr)
     return {"job_id": job_id, "status": "pending", "message": "OCR processing started."}
 
 
@@ -2069,7 +1882,7 @@ async def redact_pdf_endpoint(
     redactions: str = Form(...)
 ):
     """Redact (permanently remove) content from PDF pages."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -2096,12 +1909,12 @@ async def redact_pdf_endpoint(
         tool="redact"
     )
 
-    async def process_redact():
+    def process_redact():
         try:
             jobs[job_id].status = "processing"
             result = redact_pdf(content, redaction_list)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             output_path = os.path.join(job_temp_dir, "output.pdf")
@@ -2120,7 +1933,7 @@ async def redact_pdf_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_redact)
+    background_tasks.add_task(_run_limited_job, process_redact)
     return {"job_id": job_id, "status": "pending", "message": "Redaction started."}
 
 
@@ -2132,8 +1945,8 @@ async def compare_pdfs_endpoint(
     diff_mode: str = Form(default="text")
 ):
     """Compare two PDFs and return differences."""
-    content1 = await file1.read()
-    content2 = await file2.read()
+    content1 = await _read_limited_upload(file1, require_pdf=True)
+    content2 = await _read_limited_upload(file2, require_pdf=True)
 
     if not content1 or len(content1) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid first file size")
@@ -2156,12 +1969,12 @@ async def compare_pdfs_endpoint(
         tool="compare"
     )
 
-    async def process_compare():
+    def process_compare():
         try:
             jobs[job_id].status = "processing"
             result = compare_pdfs(content1, content2, diff_mode)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Save comparison result as JSON
@@ -2181,7 +1994,7 @@ async def compare_pdfs_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_compare)
+    background_tasks.add_task(_run_limited_job, process_compare)
     return {"job_id": job_id, "status": "pending", "message": "PDF comparison started."}
 
 
@@ -2191,7 +2004,7 @@ async def extract_text_endpoint(
     file: UploadFile = File(...)
 ):
     """Extract all text content from a PDF."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -2209,12 +2022,12 @@ async def extract_text_endpoint(
     )
     download_token = issue_download_token(job_id)
 
-    async def process_extract_text():
+    def process_extract_text():
         try:
             jobs[job_id].status = "processing"
             result = extract_text(content)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Save extracted text as JSON
@@ -2234,7 +2047,7 @@ async def extract_text_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_extract_text)
+    background_tasks.add_task(_run_limited_job, process_extract_text)
     return {"job_id": job_id, "status": "pending", "download_token": download_token, "message": "Text extraction started."}
 
 
@@ -2244,7 +2057,7 @@ async def extract_images_endpoint(
     file: UploadFile = File(...)
 ):
     """Extract all images from a PDF."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -2261,12 +2074,12 @@ async def extract_images_endpoint(
         tool="extract-images"
     )
 
-    async def process_extract_images():
+    def process_extract_images():
         try:
             jobs[job_id].status = "processing"
             images = extract_images(content)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Save images
@@ -2298,7 +2111,7 @@ async def extract_images_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_extract_images)
+    background_tasks.add_task(_run_limited_job, process_extract_images)
     return {"job_id": job_id, "status": "pending", "message": "Image extraction started."}
 
 
@@ -2308,7 +2121,7 @@ async def metadata_endpoint(
     file: UploadFile = File(...)
 ):
     """Get PDF metadata."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -2326,12 +2139,12 @@ async def metadata_endpoint(
     )
     download_token = issue_download_token(job_id)
 
-    async def process_metadata():
+    def process_metadata():
         try:
             jobs[job_id].status = "processing"
             result = get_pdf_metadata(content)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Save metadata as JSON
@@ -2349,7 +2162,7 @@ async def metadata_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_metadata)
+    background_tasks.add_task(_run_limited_job, process_metadata)
     return {
         "job_id": job_id,
         "status": "pending",
@@ -2366,7 +2179,7 @@ async def preview_endpoint(
     max_pages: int = Form(default=20)
 ):
     """Generate page preview thumbnails."""
-    content = await file.read()
+    content = await _read_limited_upload(file, require_pdf=True)
 
     if not content or len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Invalid file size")
@@ -2383,12 +2196,12 @@ async def preview_endpoint(
         tool="preview"
     )
 
-    async def process_preview():
+    def process_preview():
         try:
             jobs[job_id].status = "processing"
             previews = generate_page_previews(content, dpi=dpi, max_pages=max_pages)
 
-            job_temp_dir = f"/tmp/jobs/{job_id}"
+            job_temp_dir = os.path.join(JOBS_DIR, job_id)
             os.makedirs(job_temp_dir, exist_ok=True)
 
             # Save previews as JSON with base64 images
@@ -2408,7 +2221,7 @@ async def preview_endpoint(
             jobs[job_id].error_message = str(e)
             jobs[job_id].completed_at = datetime.utcnow()
 
-    background_tasks.add_task(process_preview)
+    background_tasks.add_task(_run_limited_job, process_preview)
     return {"job_id": job_id, "status": "pending", "message": "Preview generation started."}
 
 # ============================================================
@@ -2583,10 +2396,11 @@ async def trigger_cleanup():
 @app.on_event("startup")
 async def startup_event():
     """Application startup."""
+    global job_state_cleanup_task
     # Ensure temporary directories exist
-    os.makedirs("/tmp/uploads", exist_ok=True)
-    os.makedirs("/tmp/outputs", exist_ok=True)
-    os.makedirs("/tmp/jobs", exist_ok=True)
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    os.makedirs(JOBS_DIR, exist_ok=True)
     print("PDF Master backend started successfully")
 
     # Log startup without sensitive data
@@ -2602,11 +2416,19 @@ async def startup_event():
 
     # Start performance logging
     asyncio.create_task(log_performance_stats())
+    job_state_cleanup_task = asyncio.create_task(_cleanup_expired_job_state())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown."""
+    if job_state_cleanup_task:
+        job_state_cleanup_task.cancel()
+        try:
+            await job_state_cleanup_task
+        except asyncio.CancelledError:
+            pass
+
     # Stop cleanup service
     await stop_cleanup_service()
 

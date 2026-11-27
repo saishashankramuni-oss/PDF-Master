@@ -7,6 +7,17 @@ import fitz  # PyMuPDF
 import io
 from typing import Optional, Dict, Any, List, Tuple
 
+SUPPORTED_ANNOTATION_TYPES = frozenset({
+    "highlight",
+    "underline",
+    "strikeout",
+    "squiggly",
+    "free_text",
+    "square",
+    "circle",
+    "line",
+})
+
 
 def add_text_to_pdf(
     pdf_data: bytes,
@@ -404,6 +415,8 @@ def add_annotation_to_pdf(
         annot_rect = fitz.Rect(*rect)
 
         annotation_type = annotation_type.lower()
+        if annotation_type not in SUPPORTED_ANNOTATION_TYPES:
+            raise ValueError(f"Unsupported annotation type: {annotation_type}")
 
         if annotation_type == "highlight":
             annot = page.add_highlight_annot(annot_rect)
@@ -421,10 +434,6 @@ def add_annotation_to_pdf(
             annot = page.add_circle_annot(annot_rect)
         elif annotation_type == "line":
             annot = page.add_line_annot(annot_rect.tl, annot_rect.br)
-        else:
-            # Default to highlight
-            annot = page.add_highlight_annot(annot_rect)
-
         if annot:
             annot.set_colors(stroke=color)
             annot.set_opacity(opacity)

@@ -5,9 +5,20 @@ Handles OCR, Redaction, Compare, Extract Text/Images, Metadata, Page Preview.
 
 import fitz  # PyMuPDF
 import io
-import json
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Dict, Any, List
 import base64
+
+
+def _load_tesseract():
+    try:
+        import pytesseract
+        from PIL import Image
+        pytesseract.get_tesseract_version()
+    except Exception as exc:
+        raise RuntimeError(
+            "Tesseract OCR is unavailable. Install Tesseract and the requested language data."
+        ) from exc
+    return pytesseract, Image
 
 
 def ocr_pdf(
@@ -16,8 +27,7 @@ def ocr_pdf(
     dpi: int = 300
 ) -> bytes:
     """
-    Perform OCR on a PDF to make scanned pages searchable.
-    Uses Tesseract if available, otherwise falls back to basic text layer addition.
+    Perform OCR on scanned PDF pages and add recognized text as an invisible layer.
 
     Args:
         pdf_data: PDF file bytes
@@ -29,75 +39,61 @@ def ocr_pdf(
     """
     if not pdf_data or len(pdf_data) < 5 or pdf_data[:5] != b'%PDF-':
         raise ValueError("Invalid PDF file")
+    if not language.strip():
+        raise ValueError("OCR language must not be empty")
+    if not 72 <= dpi <= 600:
+        raise ValueError("OCR resolution must be between 72 and 600 DPI")
 
     try:
         doc = fitz.open(stream=pdf_data, filetype="pdf")
+        tesseract = None
+        image_class = None
+        scanned_pages = 0
+        recognized_pages = 0
 
-        # Check if Tesseract is available
-        tesseract_available = False
-        try:
-            import pytesseract
-            from PIL import Image
-            # Check if tesseract executable is available
-            pytesseract.get_tesseract_version()
-            tesseract_available = True
-        except Exception:
-            tesseract_available = False
+        for page_num in range(doc.page_count):
+            page = doc[page_num]
+            if page.get_text("text").strip():
+                continue
 
-        if tesseract_available:
-            # Full OCR with Tesseract
-            for page_num in range(doc.page_count):
-                page = doc[page_num]
+            if tesseract is None:
+                tesseract, image_class = _load_tesseract()
 
-                # Render page to high-res image
-                mat = fitz.Matrix(dpi / 72, dpi / 72)
-                pix = page.get_pixmap(matrix=mat)
+            scanned_pages += 1
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
+            image = image_class.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            try:
+                ocr_text = tesseract.image_to_string(image, lang=language).strip()
+            except Exception as exc:
+                raise RuntimeError(f"OCR failed on page {page_num + 1}: {exc}") from exc
 
-                # Convert to PIL Image
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            if not ocr_text:
+                continue
 
-                # Perform OCR
-                try:
-                    ocr_text = pytesseract.image_to_string(img, lang=language)
+            remaining_height = page.insert_textbox(
+                page.rect,
+                ocr_text,
+                fontsize=1,
+                fontname="helv",
+                render_mode=3,
+            )
+            if remaining_height < 0:
+                raise RuntimeError(
+                    f"OCR text from page {page_num + 1} exceeds the available page area."
+                )
+            recognized_pages += 1
 
-                    # Add text as invisible layer
-                    if ocr_text.strip():
-                        # Insert text at top-left as invisible layer
-                        page.insert_text(
-                            (50, 50),
-                            ocr_text,
-                            fontsize=1,
-                            color=(1, 1, 1),  # White/invisible
-                            render_mode=3  # Invisible text
-                        )
-                except Exception:
-                    # If OCR fails for this page, continue
-                    pass
-        else:
-            # Fallback: check existing text and mark pages as searchable
-            for page_num in range(doc.page_count):
-                page = doc[page_num]
-                text = page.get_text("text")
-                if not text.strip():
-                    # Page has no text, mark as potentially scanned
-                    page.insert_text(
-                        (50, 50),
-                        f"[Page {page_num + 1} - Scanned content]",
-                        fontsize=1,
-                        color=(1, 1, 1),
-                        render_mode=3
-                    )
+        if scanned_pages and not recognized_pages:
+            raise RuntimeError("OCR did not recognize readable text in the scanned pages.")
 
-        # Save to bytes
-        output_buffer = io.BytesIO()
-        doc.save(output_buffer)
-        doc.close()
-
-        output_buffer.seek(0)
-        return output_buffer.read()
-
-    except Exception as e:
-        raise RuntimeError(f"OCR failed: {str(e)}")
+        return doc.tobytes(garbage=4, deflate=True)
+    except Exception as exc:
+        if isinstance(exc, (ValueError, RuntimeError)):
+            raise
+        raise RuntimeError(f"OCR failed: {exc}") from exc
+    finally:
+        if "doc" in locals():
+            doc.close()
 
 
 def redact_pdf(

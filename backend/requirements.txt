@@ -8,6 +8,7 @@ Pillow
 python-docx
 pytesseract
 python-Levenshtein
+psutil>=5.9,<8
 python-multipart
 aiofiles
 starlette

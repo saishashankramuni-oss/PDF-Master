@@ -1,20 +1,21 @@
 # PDF Master - Universal PDF Processing Web Application
 
-A production-ready, cloud-based PDF processing platform inspired by iLovePDF, built with modern technologies and featuring 31 PDF tools across 7 categories.
+A responsive PDF processing application with a browser-local Image Compressor and a FastAPI backend for PDF operations.
 
 ## Features
 
-### 31 PDF Tools Across 7 Categories
+### Tools
 
 | Category | Tools |
 |----------|-------|
-| **Organize** | Merge, Split, Rotate, Extract Pages, Organize Pages |
+| **Organize** | Merge, Split, Rotate, Organize Pages |
 | **Optimize** | Compress, Repair |
 | **Security** | Protect (Password), Unlock |
 | **Convert** | PDF↔Word, PDF↔JPG, PDF↔Excel, PDF↔PowerPoint |
 | **Edit** | Add Text, Add Image, Add Watermark, Add Page Numbers, Add Signature, Add Annotation |
 | **Advanced** | OCR, Redact, Compare, Extract Text, Extract Images, Metadata, Page Preview |
-| **Platform** | Auto Cleanup, Performance Monitoring, Caching |
+| **Images** | Image Compressor (JPG, PNG, and WebP; processed in the browser) |
+| **Platform** | Automatic cleanup, performance monitoring, caching |
 
 ### Key Features
 
@@ -25,17 +26,16 @@ A production-ready, cloud-based PDF processing platform inspired by iLovePDF, bu
 - **Responsive Design** - Mobile-first, works on all screen sizes
 - **Dark/Light Theme** - User preference persistence
 - **Secure Processing** - HTTPS, rate limiting, file validation
-- **No Local Dependencies** - All processing in cloud
+- **Private Image Compression** - Image files remain in the browser; PDF operations use the configured FastAPI backend
 
 ## Technology Stack
 
 ### Frontend
 - **React 18** + Vite 5
 - **Tailwind CSS** - Custom design system
-- **React Router 6** - SPA routing
 - **Lucide React** - Icon library
 - **Vite PWA Plugin** - Service worker & manifest
-- **Axios** - API communication
+- **Fetch API** - Backend communication
 
 ### Backend
 - **FastAPI** - Modern async Python framework
@@ -45,7 +45,7 @@ A production-ready, cloud-based PDF processing platform inspired by iLovePDF, bu
 - **pdf2docx** - PDF to Word conversion
 - **python-docx** - Word document creation
 - **Pillow** - Image processing
-- **pytesseract** - OCR (with fallback)
+- **pytesseract** - OCR (requires Tesseract)
 - **LibreOffice** - Document conversions (Docker)
 - **Uvicorn** - ASGI server
 
@@ -98,7 +98,7 @@ docker-compose up --build
 ```
 pdf-master/
 ├── backend/
-│   ├── main.py                 # FastAPI application (31 endpoints)
+│   ├── main.py                 # FastAPI application and processing endpoints
 │   ├── Dockerfile              # Backend container
 │   ├── requirements.txt        # Python dependencies
 │   ├── render.yaml             # Render deployment config
@@ -129,10 +129,12 @@ pdf-master/
 │   ├── index.html              # PWA-ready HTML
 │   └── src/
 │       ├── main.jsx            # Entry point
-│       ├── App.jsx             # Main app (28 tools + routing)
+│       ├── App.jsx             # Responsive tool catalog and PDF workflows
+│       ├── api.js              # Environment-based backend URL
+│       ├── imageCompressorUtils.js
 │       ├── index.css           # Tailwind + custom styles
-│       ├── components/         # 11 reusable components
-│       └── serviceWorker.js    # PWA registration
+│       └── components/
+│           └── ImageCompressor.jsx
 │
 ├── docker-compose.yml          # Local full-stack
 ├── .env.production.example     # Production env template
@@ -148,9 +150,8 @@ pdf-master/
 - `GET /api/tools` - List all tools
 
 ### Job Management
-- `POST /api/upload` - Generic upload
 - `GET /api/jobs/{job_id}` - Job status
-- `POST /api/jobs/{job_id}/download` - Download result
+- `GET /api/jobs/{job_id}/download` - Download result
 - `DELETE /api/jobs/{job_id}` - Delete job
 
 ### Organize
@@ -210,7 +211,10 @@ pdf-master/
    - Output Directory: `dist`
    - Framework: Vite
    - Root Directory: `frontend`
-3. `frontend/vercel.json` proxies `/api/*` requests to the Render backend. Update its
+3. Set `VITE_API_BASE_URL` to the public FastAPI origin (for example,
+   `https://pdf-master-backend-i5rm.onrender.com`) in the Vercel project's
+   Environment Variables, then redeploy.
+4. `frontend/vercel.json` proxies `/api/*` requests to the Render backend. Update its
    rewrite destination if the backend URL changes.
 
 ### Backend (Render)
@@ -218,7 +222,8 @@ pdf-master/
 1. Create new Web Service on Render
 2. Select Docker runtime
 3. Use Dockerfile path `./backend/Dockerfile` and repository-root Docker context (`.`)
-4. Configure environment variables from the root `render.yaml`
+4. Configure environment variables from `backend/render.yaml`, including the
+   frontend origin in `ALLOWED_ORIGINS`
 5. Set Health Check Path: `/health`
 6. API documentation is available at `/docs`; the OpenAPI specification is at `/openapi.json`.
 

@@ -28,7 +28,9 @@ def compress_pdf(pdf_data: bytes, quality: str = "medium",
     # Normalize quality
     quality = quality.lower()
     if quality not in ["low", "medium", "high"]:
-        quality = "medium"
+        raise ValueError("Compression quality must be low, medium, or high")
+    if target_size_kb is not None and target_size_kb <= 0:
+        raise ValueError("Target size must be a positive number of kilobytes")
 
     try:
         doc = fitz.open(stream=pdf_data, filetype="pdf")
@@ -88,20 +90,22 @@ def get_compress_info(pdf_data: bytes, quality: str = "medium",
     if not pdf_data or len(pdf_data) < 5 or pdf_data[:5] != b'%PDF-':
         raise ValueError("Invalid PDF file")
 
+    doc = None
     try:
         doc = fitz.open(stream=pdf_data, filetype="pdf")
         page_count = doc.page_count
         original_size = len(pdf_data)
-        estimated_reduction = round(original_size * 0.3)  # Estimate 30% reduction
-        doc.close()
+        compressed_size = len(compress_pdf(pdf_data, quality, target_size_kb))
 
         quality_names = {"low": "Low (minimal compression)", "medium": "Medium (balanced)", "high": "High (maximum)"}
 
         return {
             "original_size": original_size,
             "original_size_mb": round(original_size / (1024 * 1024), 2),
-            "estimated_compressed_size": estimated_reduction,
-            "estimated_compressed_mb": round(estimated_reduction / (1024 * 1024), 2),
+            "compressed_size": compressed_size,
+            "compressed_size_mb": round(compressed_size / (1024 * 1024), 2),
+            "savings_bytes": original_size - compressed_size,
+            "savings_percent": round((original_size - compressed_size) / original_size * 100, 2),
             "quality": quality,
             "quality_description": quality_names.get(quality, "Medium"),
             "target_size_kb": target_size_kb,
@@ -109,3 +113,6 @@ def get_compress_info(pdf_data: bytes, quality: str = "medium",
         }
     except Exception as e:
         raise RuntimeError(f"Failed to get compress info: {str(e)}")
+    finally:
+        if doc is not None:
+            doc.close()
