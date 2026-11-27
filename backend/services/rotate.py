@@ -24,7 +24,7 @@ def rotate_pdf(pdf_data: bytes, angle: float = 90) -> bytes:
         raise ValueError("Invalid PDF file")
 
     # Normalize angle to valid values
-    angle = angle % 360
+    angle = int(round(float(angle))) % 360
     if angle not in [90, 180, 270, 0]:
         # For arbitrary angles, PyMuPDF supports them but may affect rendering
         pass

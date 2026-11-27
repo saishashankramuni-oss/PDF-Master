@@ -9,7 +9,7 @@ export default defineConfig({
     viteTsconfigPaths(),
     VitePWA({
       registerType: 'autoUpdate',
-      includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'masked-icon.svg'],
+      includeAssets: ['favicon.svg', 'pwa-192x192.png', 'pwa-512x512.png'],
       manifest: {
         name: 'PDF Master',
         short_name: 'PDF Master',

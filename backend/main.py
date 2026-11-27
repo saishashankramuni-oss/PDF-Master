@@ -14,6 +14,7 @@ import os
 import uuid
 import tempfile
 import shutil
+import zipfile
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import struct
@@ -111,6 +112,12 @@ def generate_job_id() -> str:
 def generate_download_token() -> str:
     """Generate a secure download token."""
     return str(uuid.uuid4())
+
+def issue_download_token(job_id: str) -> str:
+    token = generate_download_token()
+    download_tokens[token] = job_id
+    download_tokens[f"{token}_time"] = datetime.utcnow() + timedelta(minutes=JOB_RETENTION_MINUTES)
+    return token
 
 def is_valid_pdf_path(path: str) -> bool:
     """Check for path traversal attacks."""
@@ -239,49 +246,73 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
 
-@app.post("/api/jobs/{job_id}/download", response_model=dict)
-async def download_job(job_id: str, download_request: DownloadRequest):
-    """Download job result with token."""
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
+def _find_job_output(job_id: str) -> Optional[str]:
+    candidates = [
+        os.path.join("/tmp", "outputs", f"{job_id}_output.pdf"),
+        os.path.join("/tmp", "jobs", job_id),
+        os.path.join(tempfile.gettempdir(), "jobs", job_id),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+        if os.path.isdir(candidate):
+            for name in sorted(os.listdir(candidate)):
+                path = os.path.join(candidate, name)
+                if os.path.isfile(path):
+                    return path
+    return None
 
-    job = jobs[job_id]
-
-    # Verify token
-    if download_request.download_token not in download_tokens or download_tokens[download_request.download_token] != job_id:
+def _verified_download(job_id: str, token: Optional[str]):
+    if not token:
+        raise HTTPException(status_code=403, detail="Download token is required")
+    if download_tokens.get(token) != job_id:
         raise HTTPException(status_code=403, detail="Invalid or expired download token")
-
-    # Check expiration (tokens expire after 30 minutes)
-    token_time = download_tokens.get(f"{download_request.download_token}_time")
+    token_time = download_tokens.get(f"{token}_time")
     if token_time and datetime.utcnow() > token_time:
         raise HTTPException(status_code=410, detail="Download link expired")
 
-    # Find the output file
-    output_path = f"/tmp/outputs/{job_id}_output.pdf"
-    if os.path.exists(output_path):
-        return FileResponse(
-            path=output_path,
-            filename=job.output_filename or "output.pdf",
-            media_type="application/pdf"
-        )
+@app.get("/api/jobs/{job_id}/download")
+async def download_job_get(job_id: str, token: Optional[str] = None):
+    """Download a completed job by secure token."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _verified_download(job_id, token)
+    job = jobs[job_id]
+    if job.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Job is {job.status}")
+    output_path = _find_job_output(job_id)
+    if not output_path:
+        raise HTTPException(status_code=404, detail="Output file not found")
 
-    # If file not found, check if job is completed and try to generate it
-    if job.status == "completed":
-        # Try to generate the output file based on the tool
-        try:
-            await generate_output_file(job_id)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate output: {str(e)}")
+    filename = job.output_filename or os.path.basename(output_path)
+    suffix = os.path.splitext(filename)[1].lower()
+    media_types = {
+        ".pdf": "application/pdf",
+        ".zip": "application/zip",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".txt": "text/plain",
+        ".json": "application/json",
+    }
+    return FileResponse(output_path, filename=filename, media_type=media_types.get(suffix, "application/octet-stream"))
 
-    # Final check
-    if os.path.exists(output_path):
-        return FileResponse(
-            path=output_path,
-            filename=job.output_filename or "output.pdf",
-            media_type="application/pdf"
-        )
-
-    raise HTTPException(status_code=404, detail="Output file not found")
+@app.post("/api/jobs/{job_id}/download")
+async def download_job_post(job_id: str, download_request: DownloadRequest):
+    """Download a completed job using a POST token request."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    _verified_download(job_id, download_request.download_token)
+    job = jobs[job_id]
+    if job.status != "completed":
+        raise HTTPException(status_code=409, detail=f"Job is {job.status}")
+    output_path = _find_job_output(job_id)
+    if not output_path:
+        raise HTTPException(status_code=404, detail="Output file not found")
+    return FileResponse(output_path, filename=job.output_filename or os.path.basename(output_path), media_type="application/octet-stream")
 
 @app.delete("/api/jobs/{job_id}")
 async def delete_job(job_id: str):
@@ -514,6 +545,7 @@ async def merge_pdf_endpoint(
         original_filename="merged.pdf",
         tool="merge"
     )
+    download_token = issue_download_token(job_id)
 
     # Start background processing
     async def process_merge():
@@ -552,6 +584,7 @@ async def merge_pdf_endpoint(
     return {
         "job_id": job_id,
         "status": "pending",
+        "download_token": download_token,
         "message": "PDF merge started. Processing in background."
     }
 
@@ -564,6 +597,8 @@ async def split_pdf_endpoint(
     """Split a PDF into individual pages or selected ranges."""
     # Read file content
     content = await file.read()
+    if not content or len(content) > MAX_FILE_SIZE or not validate_pdf_signature(content):
+        raise HTTPException(status_code=400, detail="Invalid PDF file")
 
     # Parse page numbers
     page_list = []
@@ -584,6 +619,7 @@ async def split_pdf_endpoint(
         original_filename=file.filename,
         tool="split"
     )
+    download_token = issue_download_token(job_id)
 
     # Start background processing
     async def process_split():
@@ -603,11 +639,22 @@ async def split_pdf_endpoint(
                 with open(output_path, "wb") as f:
                     f.write(result)
 
+            if len(results) > 1:
+                zip_path = os.path.join(job_temp_dir, "split_pages.zip")
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for i in range(len(results)):
+                        archive.write(
+                            os.path.join(job_temp_dir, f"split_{i+1}.pdf"),
+                            arcname=f"page_{i+1}.pdf",
+                        )
+                jobs[job_id].output_filename = "split_pages.zip"
+            else:
+                jobs[job_id].output_filename = "split_1.pdf"
+
             # Update job status
             jobs[job_id].status = "completed"
             jobs[job_id].completed_at = datetime.utcnow()
             jobs[job_id].progress = 100.0
-            jobs[job_id].output_filename = f"split_{len(results)}_parts.pdf"
 
             # Generate download token
             token = generate_download_token()
@@ -623,6 +670,7 @@ async def split_pdf_endpoint(
     return {
         "job_id": job_id,
         "status": "pending",
+        "download_token": download_token,
         "message": "PDF split started. Processing in background."
     }
 
@@ -635,6 +683,8 @@ async def rotate_pdf_endpoint(
     """Rotate a PDF by specified angle."""
     # Read file content
     content = await file.read()
+    if not content or len(content) > MAX_FILE_SIZE or not validate_pdf_signature(content):
+        raise HTTPException(status_code=400, detail="Invalid PDF file")
 
     # Generate job ID
     job_id = generate_job_id()
@@ -647,6 +697,7 @@ async def rotate_pdf_endpoint(
         original_filename=file.filename,
         tool="rotate"
     )
+    download_token = issue_download_token(job_id)
 
     # Start background processing
     async def process_rotate():
@@ -685,6 +736,7 @@ async def rotate_pdf_endpoint(
     return {
         "job_id": job_id,
         "status": "pending",
+        "download_token": download_token,
         "message": "PDF rotate started. Processing in background."
     }
 
@@ -697,6 +749,8 @@ async def compress_pdf_endpoint(
     """Compress a PDF file."""
     # Read file content
     content = await file.read()
+    if not content or len(content) > MAX_FILE_SIZE or not validate_pdf_signature(content):
+        raise HTTPException(status_code=400, detail="Invalid PDF file")
 
     # Generate job ID
     job_id = generate_job_id()
@@ -709,6 +763,7 @@ async def compress_pdf_endpoint(
         original_filename=file.filename,
         tool="compress"
     )
+    download_token = issue_download_token(job_id)
 
     # Start background processing
     async def process_compress():
@@ -747,6 +802,7 @@ async def compress_pdf_endpoint(
     return {
         "job_id": job_id,
         "status": "pending",
+        "download_token": download_token,
         "message": "PDF compression started. Processing in background."
     }
 
@@ -2073,6 +2129,7 @@ async def extract_text_endpoint(
         original_filename=file.filename,
         tool="extract-text"
     )
+    download_token = issue_download_token(job_id)
 
     async def process_extract_text():
         try:
@@ -2100,7 +2157,7 @@ async def extract_text_endpoint(
             jobs[job_id].completed_at = datetime.utcnow()
 
     background_tasks.add_task(process_extract_text)
-    return {"job_id": job_id, "status": "pending", "message": "Text extraction started."}
+    return {"job_id": job_id, "status": "pending", "download_token": download_token, "message": "Text extraction started."}
 
 
 @app.post("/api/pdf/extract-images")
