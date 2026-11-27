@@ -6,19 +6,26 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+COPY backend/requirements.txt ./requirements.txt
+
 # Install the system tools used by OCR and Office document conversions.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    build-essential \
+    libxml2 \
+    libxml2-dev \
+    libxslt1.1 \
+    libxslt1-dev \
+    zlib1g-dev \
     libreoffice-writer \
     libreoffice-calc \
     libreoffice-impress \
     tesseract-ocr \
     tesseract-ocr-eng \
+    && pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y --auto-remove build-essential libxml2-dev libxslt1-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
-
-COPY backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ .
 
