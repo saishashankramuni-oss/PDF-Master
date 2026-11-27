@@ -171,6 +171,9 @@ def check_job_processing(first, second):
         ("split", "/api/pdf/split", {}, [
             ("file", "test_sample.pdf", first),
         ]),
+        ("to-jpg", "/api/pdf/to-jpg", {"dpi": "72"}, [
+            ("file", "test_sample.pdf", first),
+        ]),
         ("rotate", "/api/pdf/rotate", {"angle": "90"}, [
             ("file", "test_sample.pdf", first),
         ]),
@@ -220,6 +223,13 @@ def check_job_processing(first, second):
             with zipfile.ZipFile(io.BytesIO(output)) as archive:
                 assert_pdf(archive.read("page_1.pdf"), 1)
                 assert_pdf(archive.read("page_2.pdf"), 1)
+        elif name == "to-jpg":
+            assert content_type == "application/zip", content_type
+            with zipfile.ZipFile(io.BytesIO(output)) as archive:
+                names = archive.namelist()
+                assert names == ["page_1.jpg", "page_2.jpg"], names
+                for image_name in names:
+                    assert archive.read(image_name).startswith(b"\xff\xd8"), image_name
         else:
             payload = json.loads(output)
             if name == "extract-text":

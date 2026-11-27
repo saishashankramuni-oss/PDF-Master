@@ -1137,7 +1137,8 @@ async def pdf_to_jpg_endpoint(
             # For download, we'll create a zip or just return the first image
             # For simplicity, create a zip file
             import zipfile
-            zip_path = os.path.join(job_temp_dir, "output.zip")
+            output_filename = f"output_{len(images)}_pages.zip"
+            zip_path = os.path.join(job_temp_dir, output_filename)
             with zipfile.ZipFile(zip_path, 'w') as zf:
                 for i, img in enumerate(images):
                     zf.writestr(f"page_{i+1}.jpg", img)
@@ -1145,7 +1146,7 @@ async def pdf_to_jpg_endpoint(
             jobs[job_id].status = "completed"
             jobs[job_id].completed_at = datetime.utcnow()
             jobs[job_id].progress = 100.0
-            jobs[job_id].output_filename = f"output_{len(images)}_pages.zip"
+            jobs[job_id].output_filename = output_filename
 
             token = generate_download_token()
             download_tokens[token] = job_id
