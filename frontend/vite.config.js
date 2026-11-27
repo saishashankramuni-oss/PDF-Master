@@ -42,7 +42,18 @@ export default defineConfig({
     }),
   ],
   server: {
+    host: '127.0.0.1',
     port: 3000,
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/health': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+    },
   },
   // Inject the service worker registration code into the app
   // This will be included in the generated index.html
