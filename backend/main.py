@@ -6,6 +6,8 @@ FastAPI-based PDF processing service
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+import zipfile
 from pydantic import BaseModel, Field
 import asyncio
 import os
@@ -157,6 +159,66 @@ from services.performance import (
 async def root():
     """Basic service check for hosting platforms."""
     return {"name": "PDF Master API", "status": "running", "health": "/health", "docs": "/api/docs"}
+
+@app.post("/api/process/{tool}")
+async def process_pdf_direct(tool: str, files: List[UploadFile] = File(...), angle: int = Form(90), quality: str = Form("medium")):
+    """Process common PDF operations synchronously and return the resulting file."""
+    allowed = {"merge", "split", "rotate", "compress", "extract-text", "metadata"}
+    if tool not in allowed:
+        raise HTTPException(status_code=400, detail="Unsupported tool")
+    if not files:
+        raise HTTPException(status_code=400, detail="Upload at least one file")
+    contents = []
+    for upload in files:
+        data = await upload.read()
+        if not data or len(data) > MAX_FILE_SIZE or not validate_pdf_signature(data):
+            raise HTTPException(status_code=400, detail=f"Invalid PDF or file exceeds 50 MB: {upload.filename}")
+        contents.append(data)
+    if tool != "merge" and len(contents) != 1:
+        raise HTTPException(status_code=400, detail="This operation accepts exactly one PDF")
+    try:
+        if tool == "merge":
+            result = merge_pdfs(contents)
+            filename, media_type = "merged.pdf", "application/pdf"
+        elif tool == "split":
+            pages = split_pdf(contents[0])
+            tmp = tempfile.NamedTemporaryFile(prefix="pdf-master-", suffix=".zip", delete=False)
+            tmp.close()
+            with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as archive:
+                for index, page in enumerate(pages, 1):
+                    archive.writestr(f"page-{index}.pdf", page)
+            return FileResponse(tmp.name, media_type="application/zip", filename="split-pages.zip", background=BackgroundTask(os.unlink, tmp.name))
+        elif tool == "rotate":
+            result = rotate_pdf(contents[0], angle=angle)
+            filename, media_type = "rotated.pdf", "application/pdf"
+        elif tool == "compress":
+            result = compress_pdf(contents[0], quality=quality)
+            filename, media_type = "compressed.pdf", "application/pdf"
+        elif tool == "extract-text":
+            doc = fitz.open(stream=contents[0], filetype="pdf")
+            text_content = "\\n\\n".join(page.get_text() for page in doc)
+            doc.close()
+            result = text_content.encode("utf-8")
+            filename, media_type = "extracted-text.txt", "text/plain; charset=utf-8"
+        else:
+            doc = fitz.open(stream=contents[0], filetype="pdf")
+            result = (json.dumps({"page_count": doc.page_count, "metadata": doc.metadata}, indent=2, ensure_ascii=False)).encode("utf-8")
+            doc.close()
+            filename, media_type = "metadata.json", "application/json"
+        tmp = tempfile.NamedTemporaryFile(prefix="pdf-master-", suffix=os.path.splitext(filename)[1], delete=False)
+        try:
+            tmp.write(result)
+            tmp.close()
+        except Exception:
+            tmp.close()
+            os.unlink(tmp.name)
+            raise
+        return FileResponse(tmp.name, media_type=media_type, filename=filename, background=BackgroundTask(os.unlink, tmp.name))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("PDF processing failed for tool %s", tool)
+        raise HTTPException(status_code=422, detail=f"PDF processing failed: {str(exc)}")
 
 @app.get("/health", response_model=HealthCheck)
 async def health_check():
