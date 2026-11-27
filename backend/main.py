@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import struct
 import logging
+import json
+import fitz
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
